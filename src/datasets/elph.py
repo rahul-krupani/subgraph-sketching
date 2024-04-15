@@ -211,10 +211,10 @@ class HashDataset(Dataset):
                 self.links), 'subgraph features are a different shape link object. Delete subgraph features file and regenerate'
             if self.cache_subgraph_features:
                 torch.save(self.subgraph_features, subgraph_cache_name)
-        if self.args.floor_sf and self.subgraph_features is not None:
-            self.subgraph_features[self.subgraph_features < 0] = 0
-            print(
-                f'setting {torch.sum(self.subgraph_features[self.subgraph_features < 0]).item()} negative values to zero')
+        # if self.args.floor_sf and self.subgraph_features is not None:
+        #     self.subgraph_features[self.subgraph_features < 0] = 0
+        #     print(
+        #         f'setting {torch.sum(self.subgraph_features[self.subgraph_features < 0]).item()} negative values to zero')
         if not self.use_zero_one and self.subgraph_features is not None:  # knock out the zero_one features (0,1) and (1,0)
             if self.max_hash_hops > 1:
                 self.subgraph_features[:, [4, 5]] = 0

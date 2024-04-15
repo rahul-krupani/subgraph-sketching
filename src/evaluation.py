@@ -81,7 +81,7 @@ def evaluate_mrr(evaluator, pos_train_pred, neg_train_pred, pos_val_pred, neg_va
     return results
 
 
-def evaluate_auc(val_pred, val_true, test_pred, test_true):
+def evaluate_auc(train_pred, train_true, val_pred, val_true, test_pred, test_true):
     """
     the ROC AUC
     :param val_pred: Tensor[val edges] predictions
@@ -90,9 +90,10 @@ def evaluate_auc(val_pred, val_true, test_pred, test_true):
     :param test_true: Tensor[test edges] labels
     :return:
     """
+    train_auc = roc_auc_score(train_true, train_pred)
     valid_auc = roc_auc_score(val_true, val_pred)
     test_auc = roc_auc_score(test_true, test_pred)
     results = {}
-    results['AUC'] = (valid_auc, test_auc)
+    results['AUC'] = (train_auc, valid_auc, test_auc)
 
     return results

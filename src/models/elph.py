@@ -235,7 +235,7 @@ class BUDDY(torch.nn.Module):
         # using both unormalised and degree normalised counts as features, hence * 2
         self.append_normalised = args.add_normed_features
         ra_counter = 1 if args.use_RA else 0
-        num_labelling_features = args.max_hash_hops * (args.max_hash_hops + 2)
+        num_labelling_features = args.max_hash_hops * (args.max_hash_hops + 2) #+ 1
         self.dim = num_labelling_features * 2 if self.append_normalised else num_labelling_features
         self.use_RA = args.use_RA
         self.sign_k = args.sign_k

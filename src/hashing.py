@@ -4,15 +4,20 @@ hashed based data sketching for graphs. Implemented in pytorch, but based on the
 from time import time
 import logging
 
+import networkx as nx
+from GraphRicciCurvature.OllivierRicci import OllivierRicci
+from torch_geometric.datasets import Planetoid
 from tqdm import tqdm
 import torch
-from torch import float
 import numpy as np
 from pandas.util import hash_array
 from datasketch import HyperLogLogPlusPlus, hyperloglog_const
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops
+from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
+
+from src.lcc import get_largest_connected_component, get_node_mapper, remap_edges
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -255,6 +260,96 @@ class ElphHashes(object):
             raise ValueError('source and destination hash value shapes must be the same')
         return torch.count_nonzero(src == dst, dim=-1) / self.num_perm
 
+    def gen_neighborhood(self, src, dst, links):
+        if self.max_hops == 1:
+            u_neighbors = links[1][links[0] == src]
+            v_neighbors = links[1][links[0] == dst]
+            neighbors = torch.unique(torch.cat((u_neighbors, v_neighbors)))
+
+        if self.max_hops == 2:
+            u_neighbors = links[1][links[0] == src]
+            v_neighbors = links[1][links[0] == dst]
+            u_neighbors_2 = links[0][links[1] == src]
+            v_neighbors_2 = links[0][links[1] == dst]
+            neighbors = torch.unique(torch.cat((u_neighbors, v_neighbors, u_neighbors_2, v_neighbors_2)))
+            # Find 2-hop neighbors for u and v
+            u_2_hop_neighbors = torch.unique(
+                torch.cat([links[1][links[0] == neighbor] for neighbor in neighbors]))
+            v_2_hop_neighbors = torch.unique(
+                torch.cat([links[0][links[1] == neighbor] for neighbor in neighbors]))
+
+            # Combine 1-hop and 2-hop neighbors and remove duplicates
+            neighbors = torch.unique(torch.cat((neighbors, u_2_hop_neighbors, v_2_hop_neighbors)))
+
+        return neighbors
+
+    def calc_ricci(self, neighborhood, src, dst):
+        G = nx.Graph()
+        G.add_edges_from(neighborhood)
+        orc = OllivierRicci(G, proc=4, alpha=0.5, verbose="INFO", shortest_path="pairwise")
+        out = orc.compute_ricci_curvature_edges([[src, dst]])
+        return out[(src, dst)]
+
+    def load_ricci(self):
+        dataset = Planetoid(root='/home/resl/csci566/subgraph-sketching/dataset/Cora', name='Cora')
+        lcc = get_largest_connected_component(dataset)
+
+        x_new = dataset.data.x[lcc]
+        y_new = dataset.data.y[lcc]
+
+        row, col = dataset.data.edge_index.numpy()
+        edges = [[i, j] for i, j in zip(row, col) if i in lcc and j in lcc]
+        edges = remap_edges(edges, get_node_mapper(lcc))
+
+        data = Data(
+            x=x_new,
+            edge_index=torch.LongTensor(edges),
+            y=y_new,
+            train_mask=torch.zeros(y_new.size()[0], dtype=torch.bool),
+            test_mask=torch.zeros(y_new.size()[0], dtype=torch.bool),
+            val_mask=torch.zeros(y_new.size()[0], dtype=torch.bool)
+        )
+        dataset.data = data
+
+        # Get the edge index from the data
+        edge_index = dataset[0].edge_index
+
+        # Initialize an empty NetworkX graph
+        G = nx.Graph()
+
+        # Add edges to the NetworkX graph
+        for i in range(edge_index.shape[1]):
+            source = edge_index[0, i].item()
+            target = edge_index[1, i].item()
+            G.add_edge(source, target)
+
+        # print("Number of nodes:", G.number_of_nodes())
+        # print("Number of edges:", G.number_of_edges())
+
+        orc = OllivierRicci(G, alpha=0.5, verbose="INFO")
+        orc.compute_ricci_curvature()
+        return orc.G
+        # edges_dict = {}
+        #
+        # # Open the .edge_list file in read mode
+        # with open("/home/resl/csci566/subgraph-sketching/src/datasets/graph_Cora.edge_list", "r") as file:
+        #     # Iterate over each line in the file
+        #     for line in file:
+        #         parts = line.strip().split()
+        #         node1, node2, weight = int(parts[0]), int(parts[1]), float(parts[2])
+        #         edges_dict[(node1, node2)] = weight
+        #
+        # return edges_dict
+
+    def get_ricci(self, links, ricci_graph):
+        ricci = []
+        for link in links:
+            try:
+                ricci.append(ricci_graph[int(link[0])][int(link[1])]["ricciCurvature"])
+            except:
+                ricci.append(0.0)
+        return torch.tensor(ricci)
+
     def get_subgraph_features(self, links, hash_table, cards, batch_size=11000000):
         """
         extracts the features that play a similar role to the labeling trick features. These can be thought of as approximations
@@ -267,12 +362,16 @@ class ElphHashes(object):
         """
         if links.dim() == 1:
             links = links.unsqueeze(0)
+
+        #ricci_G = self.load_ricci()
+
         link_loader = DataLoader(range(links.size(0)), batch_size, shuffle=False, num_workers=0)
         all_features = []
         for batch in tqdm(link_loader):
-            intersections = self._get_intersections(links[batch], hash_table)
+            intersections = self.get_intersections(links[batch], hash_table)
+            #ricci = self.get_ricci(links[batch], ricci_G)
             cards1, cards2 = cards.to(links.device)[links[batch, 0]], cards.to(links.device)[links[batch, 1]]
-            features = torch.zeros((len(batch), self.max_hops * (self.max_hops + 2)), dtype=float, device=links.device)
+            features = torch.zeros((len(batch), self.max_hops * (self.max_hops + 2)), dtype=torch.float, device=links.device)
             features[:, 0] = intersections[(1, 1)]
             if self.max_hops == 1:
                 features[:, 1] = cards2[:, 0] - features[:, 0]
@@ -307,6 +406,7 @@ class ElphHashes(object):
                                                                                                         12]  # (3, 0)
             else:
                 raise NotImplementedError("Only 1, 2 and 3 hop hashes are implemented")
+            #features[:, -1] = ricci
             if not self.use_zero_one:
                 if self.max_hops == 2:  # for two hops any positive edge that's dist 1 from u must be dist 2 from v etc.
                     features[:, 4] = 0
