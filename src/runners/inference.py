@@ -1,205 +1,423 @@
 """
-testing / inference functions
+hashed based data sketching for graphs. Implemented in pytorch, but based on the datasketch library
 """
-import time
-from math import inf
+from time import time
+import logging
 
-import torch
-from torch.utils.data import DataLoader
+import networkx as nx
+from GraphRicciCurvature.OllivierRicci import OllivierRicci
+from torch_geometric.datasets import Planetoid
 from tqdm import tqdm
-import wandb
+import torch
 import numpy as np
+from pandas.util import hash_array
+from datasketch import HyperLogLogPlusPlus, hyperloglog_const
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import add_self_loops
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
 
-from src.evaluation import evaluate_auc, evaluate_hits, evaluate_mrr
-from src.utils import get_num_samples
+from src.lcc import get_largest_connected_component, get_node_mapper, remap_edges
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-def get_test_func(model_str):
-    if model_str == 'ELPH':
-        return get_elph_preds
-    elif model_str == 'BUDDY':
-        return get_buddy_preds
-    else:
-        return get_preds
-
-
-@torch.no_grad()
-def test(model, evaluator, train_loader, val_loader, test_loader, args, device, emb=None, eval_metric='hits'):
-    print('starting testing')
-    t0 = time.time()
-    model.eval()
-    print("get train predictions")
-    test_func = get_test_func(args.model)
-    pos_train_pred, neg_train_pred, train_pred, train_true = test_func(model, train_loader, device, args, split='train')
-    print("get val predictions")
-    pos_val_pred, neg_val_pred, val_pred, val_true = test_func(model, val_loader, device, args, split='val')
-    print("get test predictions")
-    pos_test_pred, neg_test_pred, test_pred, test_true = test_func(model, test_loader, device, args, split='test')
-
-    if eval_metric == 'hits':
-        results = evaluate_hits(evaluator, pos_train_pred, neg_train_pred, pos_val_pred, neg_val_pred, pos_test_pred,
-                                neg_test_pred, Ks=[args.K])
-    elif eval_metric == 'mrr':
-
-        results = evaluate_mrr(evaluator, pos_train_pred, neg_train_pred, pos_val_pred, neg_val_pred, pos_test_pred,
-                               neg_test_pred)
-    elif eval_metric == 'auc':
-        results = evaluate_auc(train_pred, train_true, val_pred, val_true, test_pred, test_true)
-
-    print(f'testing ran in {time.time() - t0}')
-
-    return results
+# the LABEL_LOOKUP primary key is the max hops, secondary key is an index into the feature vector and values are hops
+# from nodes (u,v)
+LABEL_LOOKUP = {1: {0: (1, 1), 1: (0, 1), 2: (1, 0)},
+                2: {0: (1, 1), 1: (2, 1), 2: (1, 2), 3: (2, 2), 4: (0, 1), 5: (1, 0), 6: (0, 2), 7: (2, 0)},
+                3: {0: (1, 1), 1: (2, 1), 2: (1, 2), 3: (2, 2), 4: (3, 1), 5: (1, 3), 6: (3, 2), 7: (2, 3), 8: (3, 3),
+                    9: (0, 1), 10: (1, 0), 11: (0, 2), 12: (2, 0), 13: (0, 3), 14: (3, 0)}}
 
 
-@torch.no_grad()
-def get_preds(model, loader, device, args, emb=None, split=None):
-    n_samples = get_split_samples(split, args, len(loader.dataset))
-    y_pred, y_true = [], []
-    pbar = tqdm(loader, ncols=70)
-    if args.wandb:
-        wandb.log({f"inference_{split}_total_batches": len(loader)})
-    batch_processing_times = []
-    t0 = time.time()
-    for batch_count, data in enumerate(pbar):
-        start_time = time.time()
-        # todo this should not get hit, refactor out the if statement
-        if args.model == 'BUDDY':
-            data_dev = [elem.squeeze().to(device) for elem in data]
-            logits = model(*data_dev[:-1])
-            y_true.append(data[-1].view(-1).cpu().to(torch.float))
-        else:
-            data = data.to(device)
-            x = data.x if args.use_feature else None
-            edge_weight = data.edge_weight if args.use_edge_weight else None
-            node_id = data.node_id if emb else None
-            logits = model(data.z, data.edge_index, data.batch, x, edge_weight, node_id, data.src_degree,
-                           data.dst_degree)
-            y_true.append(data.y.view(-1).cpu().to(torch.float))
-        y_pred.append(logits.view(-1).cpu())
-        batch_processing_times.append(time.time() - start_time)
-        if (batch_count + 1) * args.batch_size > n_samples:
-            del data
-            torch.cuda.empty_cache()
-            break
-        del data
-        torch.cuda.empty_cache()
-    if args.wandb:
-        wandb.log({f"inference_{split}_batch_time": np.mean(batch_processing_times)})
-        wandb.log({f"inference_{split}_epoch_time": time.time() - t0})
+class MinhashPropagation(MessagePassing):
+    def __init__(self):
+        super().__init__(aggr='max')
 
-    pred, true = torch.cat(y_pred), torch.cat(y_true)
-    pos_pred = pred[true == 1]
-    neg_pred = pred[true == 0]
-    samples_used = len(loader.dataset) if n_samples > len(loader.dataset) else n_samples
-    print(f'{len(pos_pred)} positives and {len(neg_pred)} negatives for sample of {samples_used} edges')
-    return pos_pred, neg_pred, pred, true
+    @torch.no_grad()
+    def forward(self, x, edge_index):
+        out = self.propagate(edge_index, x=-x)
+        return -out
 
 
-@torch.no_grad()
-def get_buddy_preds(model, loader, device, args, split=None):
-    n_samples = get_split_samples(split, args, len(loader.dataset))
-    t0 = time.time()
-    preds = []
-    data = loader.dataset
-    # hydrate edges
-    links = data.links
-    labels = torch.tensor(data.labels)
-    loader = DataLoader(range(len(links)), args.eval_batch_size,
-                        shuffle=False)  # eval batch size should be the largest that fits on GPU
-    if model.node_embedding is not None:
-        if args.propagate_embeddings:
-            emb = model.propagate_embeddings_func(data.edge_index.to(device))
-        else:
-            emb = model.node_embedding.weight
-    else:
-        emb = None
-    for batch_count, indices in enumerate(tqdm(loader)):
-        curr_links = links[indices]
-        batch_emb = None if emb is None else emb[curr_links].to(device)
-        if args.use_struct_feature:
-            subgraph_features = data.subgraph_features[indices].to(device)
-        else:
-            subgraph_features = torch.zeros(data.subgraph_features[indices].shape).to(device)
-        node_features = data.x[curr_links].to(device)
-        degrees = data.degrees[curr_links].to(device)
-        if args.use_RA:
-            RA = data.RA[indices].to(device)
-        else:
-            RA = None
-        logits = model(subgraph_features, node_features, degrees[:, 0], degrees[:, 1], RA, batch_emb)
-        preds.append(logits.view(-1).cpu())
-        if (batch_count + 1) * args.eval_batch_size > n_samples:
-            break
+class HllPropagation(MessagePassing):
+    def __init__(self):
+        super().__init__(aggr='max')
 
-    if args.wandb:
-        wandb.log({f"inference_{split}_epoch_time": time.time() - t0})
-    pred = torch.cat(preds)
-    labels = labels[:len(pred)]
-    pos_pred = pred[labels == 1]
-    neg_pred = pred[labels == 0]
-    return pos_pred, neg_pred, pred, labels
+    @torch.no_grad()
+    def forward(self, x, edge_index):
+        out = self.propagate(edge_index, x=x)
+        return out
 
 
-def get_split_samples(split, args, dataset_len):
+class ElphHashes(object):
     """
-    get the
-    :param split: train, val, test
-    :param args: Namespace object
-    :param dataset_len: total size of dataset
-    :return:
+    class to store hashes and retrieve subgraph features
     """
-    samples = dataset_len
-    if split == 'train':
-        if args.dynamic_train:
-            samples = get_num_samples(args.train_samples, dataset_len)
-    elif split in {'val', 'valid'}:
-        if args.dynamic_val:
-            samples = get_num_samples(args.val_samples, dataset_len)
-    elif split == 'test':
-        if args.dynamic_test:
-            samples = get_num_samples(args.test_samples, dataset_len)
-    else:
-        raise NotImplementedError(f'split: {split} is not a valid split')
-    return samples
 
+    def __init__(self, args):
+        assert args.max_hash_hops in {1, 2, 3}, f'hashing is not implemented for {args.max_hash_hops} hops'
+        self.max_hops = args.max_hash_hops
+        self.floor_sf = args.floor_sf  # if true set minimum sf to 0 (they're counts, so it should be)
+        # minhash params
+        self._mersenne_prime = np.uint64((1 << 61) - 1)
+        self._max_minhash = np.uint64((1 << 32) - 1)
+        self._minhash_range = (1 << 32)
+        self.minhash_seed = 1
+        self.num_perm = args.minhash_num_perm
+        self.minhash_prop = MinhashPropagation()
+        # hll params
+        self.p = args.hll_p
+        self.m = 1 << self.p  # the bitshift way of writing 2^p
+        self.use_zero_one = args.use_zero_one
+        self.label_lookup = LABEL_LOOKUP[self.max_hops]
+        tmp = HyperLogLogPlusPlus(p=self.p)
+        # store values that are shared and only depend on p
+        self.hll_hashfunc = tmp.hashfunc
+        self.alpha = tmp.alpha
+        # the rank is the number of leading zeros. The max rank is the number of bits used in the hashes (64) minus p
+        # as p bits are used to index the different counters
+        self.max_rank = tmp.max_rank
+        assert self.max_rank == 64 - self.p, 'not using 64 bits for hll++ hashing'
+        self.hll_size = len(tmp.reg)
+        self.hll_threshold = hyperloglog_const._thresholds[self.p - 4]
+        self.bias_vector = torch.tensor(hyperloglog_const._bias[self.p - 4], dtype=torch.float)
+        self.estimate_vector = torch.tensor(hyperloglog_const._raw_estimate[self.p - 4], dtype=torch.float)
+        self.hll_prop = HllPropagation()
 
-@torch.no_grad()
-def get_elph_preds(model, loader, device, args, split=None):
-    n_samples = get_split_samples(split, args, len(loader.dataset))
-    t0 = time.time()
-    preds = []
-    data = loader.dataset
-    # hydrate edges
-    links = data.links
-    labels = torch.tensor(data.labels)
-    loader = DataLoader(range(len(links)), args.eval_batch_size,
-                        shuffle=False)  # eval batch size should be the largest that fits on GPU
-    # get node features
-    if model.node_embedding is not None:
-        if args.propagate_embeddings:
-            emb = model.propagate_embeddings_func(data.edge_index.to(device))
-        else:
-            emb = model.node_embedding.weight
-    else:
-        emb = None
-    node_features, hashes, cards = model(data.x.to(device), data.edge_index.to(device))
-    for batch_count, indices in enumerate(tqdm(loader)):
-        curr_links = links[indices].to(device)
-        batch_emb = None if emb is None else emb[curr_links].to(device)
-        if args.use_struct_feature:
-            subgraph_features = model.elph_hashes.get_subgraph_features(curr_links, hashes, cards).to(device)
-        else:
-            subgraph_features = torch.zeros(data.subgraph_features[indices].shape).to(device)
-        batch_node_features = None if node_features is None else node_features[curr_links]
-        logits = model.predictor(subgraph_features, batch_node_features, batch_emb)
-        preds.append(logits.view(-1).cpu())
-        if (batch_count + 1) * args.eval_batch_size > n_samples:
-            break
+    def _np_bit_length(self, bits):
+        """
+        Get the number of bits required to represent each int in bits array
+        @param bits: numpy [n_edges] array of ints
+        @return:
+        """
+        return np.ceil(np.log2(bits + 1)).astype(int)
 
-    if args.wandb:
-        wandb.log({f"inference_{split}_epoch_time": time.time() - t0})
-    pred = torch.cat(preds)
-    labels = labels[:len(pred)]
-    pos_pred = pred[labels == 1]
-    neg_pred = pred[labels == 0]
-    return pos_pred, neg_pred, pred, labels
+    def _get_hll_rank(self, bits):
+        """
+        get the number of leading zeros when each int in bits is represented as a self.max_rank-p bit array
+        @param bits: a numpy array of ints
+        @return:
+        """
+        # get the number of bits needed to represent each integer in bits
+        bit_length = self._np_bit_length(bits)
+        # the rank is the number of leading zeros, no idea about the +1 though
+        rank = self.max_rank - bit_length + 1
+        if min(rank) <= 0:
+            raise ValueError("Hash value overflow, maximum size is %d\
+                        bits" % self.max_rank)
+        return rank
+
+    def _init_permutations(self, num_perm):
+        # Create parameters for a random bijective permutation function
+        # that maps a 32-bit hash value to another 32-bit hash value.
+        # http://en.wikipedia.org/wiki/Universal_hashing
+        gen = np.random.RandomState(self.minhash_seed)
+        return np.array([
+            (gen.randint(1, self._mersenne_prime, dtype=np.uint64),
+             gen.randint(0, self._mersenne_prime, dtype=np.uint64)) for
+            _ in
+            range(num_perm)
+        ], dtype=np.uint64).T
+
+    def initialise_minhash(self, n_nodes):
+        init_hv = np.ones((n_nodes, self.num_perm), dtype=np.int64) * self._max_minhash
+        a, b = self._init_permutations(self.num_perm)
+        hv = hash_array(np.arange(1, n_nodes + 1))
+        phv = np.bitwise_and((a * np.expand_dims(hv, 1) + b) % self._mersenne_prime, self._max_minhash)
+        hv = np.minimum(phv, init_hv)
+        return torch.tensor(hv, dtype=torch.int64)  # this conversion should be ok as self._max_minhash < max(int64)
+
+    def initialise_hll(self, n_nodes):
+        regs = np.zeros((n_nodes, self.m), dtype=np.int8)  # the registers to store binary values
+        hv = hash_array(np.arange(1, n_nodes + 1))  # this function hashes 0 -> 0, so avoid
+        # Get the index of the register using the first p bits of the hash
+        # e.g. p=2, m=2^2=4, m-1=3=011 => only keep the right p bits
+        reg_index = hv & (self.m - 1)
+        # Get the rest of the hash. Python right shift drops the rightmost bits
+        bits = hv >> self.p
+        # Update the register
+        ranks = self._get_hll_rank(bits)  # get the number of leading zeros in each element of bits
+        regs[np.arange(n_nodes), reg_index] = np.maximum(regs[np.arange(n_nodes), reg_index], ranks)
+        return torch.tensor(regs, dtype=torch.int8)  # int8 is fine as we're storing leading zeros in 64 bit numbers
+
+    def build_hash_tables(self, num_nodes, edge_index):
+        """
+        Generate a hashing table that allows the size of the intersection of two nodes k-hop neighbours to be
+        estimated in constant time
+        @param num_nodes: The number of nodes in the graph
+        @param adj: Int Tensor [2, edges] edges in the graph
+        @return: hashes, cards. Hashes is a dictionary{dictionary}{tensor} with keys num_hops, 'hll' or 'minhash', cards
+        is a tensor[n_nodes, max_hops-1]
+        """
+        hash_edge_index, _ = add_self_loops(edge_index)
+        cards = torch.zeros((num_nodes, self.max_hops))
+        node_hashings_table = {}
+        for k in range(self.max_hops + 1):
+            logger.info(f"Calculating hop {k} hashes")
+            node_hashings_table[k] = {'hll': torch.zeros((num_nodes, self.hll_size), dtype=torch.int8),
+                                      'minhash': torch.zeros((num_nodes, self.num_perm), dtype=torch.int64)}
+            start = time()
+            if k == 0:
+                node_hashings_table[k]['minhash'] = self.initialise_minhash(num_nodes)
+                node_hashings_table[k]['hll'] = self.initialise_hll(num_nodes)
+            else:
+                node_hashings_table[k]['hll'] = self.hll_prop(node_hashings_table[k - 1]['hll'], hash_edge_index)
+                node_hashings_table[k]['minhash'] = self.minhash_prop(node_hashings_table[k - 1]['minhash'],
+                                                                      hash_edge_index)
+                cards[:, k - 1] = self.hll_count(node_hashings_table[k]['hll'])
+            logger.info(f'{k} hop hash generation ran in {time() - start} s')
+        return node_hashings_table, cards
+
+    def _get_intersections(self, edge_list, hash_table):
+        """
+        extract set intersections as jaccard * union
+        @param edge_list: [n_edges, 2] tensor to get intersections for
+        @param hash_table:
+        @param max_hops:
+        @param p: hll precision parameter. hll uses 6 * 2^p bits
+        @return:
+        """
+        intersections = {}
+        # create features for each combination of hops.
+        for k1 in range(1, self.max_hops + 1):
+            for k2 in range(1, self.max_hops + 1):
+                src_hll = hash_table[k1]['hll'][edge_list[:, 0]]
+                src_minhash = hash_table[k1]['minhash'][edge_list[:, 0]]
+                dst_hll = hash_table[k2]['hll'][edge_list[:, 1]]
+                dst_minhash = hash_table[k2]['minhash'][edge_list[:, 1]]
+                jaccard = self.jaccard(src_minhash, dst_minhash)
+                unions = self._hll_merge(src_hll, dst_hll)
+                union_size = self.hll_count(unions)
+                intersection = jaccard * union_size
+                intersections[(k1, k2)] = intersection
+        return intersections
+
+    def get_hashval(self, x):
+        return x.hashvals
+
+    def _linearcounting(self, num_zero):
+        return self.m * torch.log(self.m / num_zero)
+
+    def _estimate_bias(self, e):
+        """
+        Not exactly sure what this is doing or why exactly 6 nearest neighbours are used.
+        @param e: torch tensor [n_links] of estimates
+        @return:
+        """
+        nearest_neighbors = torch.argsort((e.unsqueeze(-1) - self.estimate_vector.to(e.device)) ** 2)[:, :6]
+        return torch.mean(self.bias_vector.to(e.device)[nearest_neighbors], dim=1)
+
+    def _refine_hll_count_estimate(self, estimate):
+        idx = estimate <= 5 * self.m
+        estimate_bias = self._estimate_bias(estimate)
+        estimate[idx] = estimate[idx] - estimate_bias[idx]
+        return estimate
+
+    def hll_count(self, regs):
+        """
+        Estimate the size of set unions associated with regs
+        @param regs: A tensor of registers [n_nodes, register_size]
+        @return:
+        """
+        if regs.dim() == 1:
+            regs = regs.unsqueeze(dim=0)
+        retval = torch.ones(regs.shape[0], device=regs.device) * self.hll_threshold + 1
+        num_zero = self.m - torch.count_nonzero(regs, dim=1)
+        idx = num_zero > 0
+        lc = self._linearcounting(num_zero[idx])
+        retval[idx] = lc
+        # we only keep lc values where lc <= self.hll_threshold, otherwise
+        estimate_indices = retval > self.hll_threshold
+        # Use HyperLogLog estimation function
+        e = (self.alpha * self.m ** 2) / torch.sum(2.0 ** (-regs[estimate_indices]), dim=1)
+        # for some reason there are two more cases
+        e = self._refine_hll_count_estimate(e)
+        retval[estimate_indices] = e
+        return retval
+
+    def _hll_merge(self, src, dst):
+        if src.shape != dst.shape:
+            raise ValueError('source and destination register shapes must be the same')
+        return torch.maximum(src, dst)
+
+    def hll_neighbour_merge(self, root, neighbours):
+        all_regs = torch.cat([root.unsqueeze(dim=0), neighbours], dim=0)
+        return torch.max(all_regs, dim=0)[0]
+
+    def minhash_neighbour_merge(self, root, neighbours):
+        all_regs = torch.cat([root.unsqueeze(dim=0), neighbours], dim=0)
+        return torch.min(all_regs, dim=0)[0]
+
+    def jaccard(self, src, dst):
+        """
+        get the minhash Jaccard estimate
+        @param src: tensor [n_edges, num_perms] of hashvalues
+        @param dst: tensor [n_edges, num_perms] of hashvalues
+        @return: tensor [n_edges] jaccard estimates
+        """
+        if src.shape != dst.shape:
+            raise ValueError('source and destination hash value shapes must be the same')
+        return torch.count_nonzero(src == dst, dim=-1) / self.num_perm
+
+    def gen_neighborhood(self, src, dst, links):
+        if self.max_hops == 1:
+            u_neighbors = links[1][links[0] == src]
+            v_neighbors = links[1][links[0] == dst]
+            neighbors = torch.unique(torch.cat((u_neighbors, v_neighbors)))
+
+        if self.max_hops == 2:
+            u_neighbors = links[1][links[0] == src]
+            v_neighbors = links[1][links[0] == dst]
+            u_neighbors_2 = links[0][links[1] == src]
+            v_neighbors_2 = links[0][links[1] == dst]
+            neighbors = torch.unique(torch.cat((u_neighbors, v_neighbors, u_neighbors_2, v_neighbors_2)))
+            # Find 2-hop neighbors for u and v
+            u_2_hop_neighbors = torch.unique(
+                torch.cat([links[1][links[0] == neighbor] for neighbor in neighbors]))
+            v_2_hop_neighbors = torch.unique(
+                torch.cat([links[0][links[1] == neighbor] for neighbor in neighbors]))
+
+            # Combine 1-hop and 2-hop neighbors and remove duplicates
+            neighbors = torch.unique(torch.cat((neighbors, u_2_hop_neighbors, v_2_hop_neighbors)))
+
+        return neighbors
+
+    def calc_ricci(self, neighborhood, src, dst):
+        G = nx.Graph()
+        G.add_edges_from(neighborhood)
+        orc = OllivierRicci(G, proc=4, alpha=0.5, verbose="INFO", shortest_path="pairwise")
+        out = orc.compute_ricci_curvature_edges([[src, dst]])
+        return out[(src, dst)]
+
+    def load_ricci(self):
+        dataset = Planetoid(root='/home/resl/csci566/subgraph-sketching/dataset/Cora', name='Cora')
+        lcc = get_largest_connected_component(dataset)
+
+        x_new = dataset.data.x[lcc]
+        y_new = dataset.data.y[lcc]
+
+        row, col = dataset.data.edge_index.numpy()
+        edges = [[i, j] for i, j in zip(row, col) if i in lcc and j in lcc]
+        edges = remap_edges(edges, get_node_mapper(lcc))
+
+        data = Data(
+            x=x_new,
+            edge_index=torch.LongTensor(edges),
+            y=y_new,
+            train_mask=torch.zeros(y_new.size()[0], dtype=torch.bool),
+            test_mask=torch.zeros(y_new.size()[0], dtype=torch.bool),
+            val_mask=torch.zeros(y_new.size()[0], dtype=torch.bool)
+        )
+        dataset.data = data
+
+        # Get the edge index from the data
+        edge_index = dataset[0].edge_index
+
+        # Initialize an empty NetworkX graph
+        G = nx.Graph()
+
+        # Add edges to the NetworkX graph
+        for i in range(edge_index.shape[1]):
+            source = edge_index[0, i].item()
+            target = edge_index[1, i].item()
+            G.add_edge(source, target)
+
+        # print("Number of nodes:", G.number_of_nodes())
+        # print("Number of edges:", G.number_of_edges())
+
+        orc = OllivierRicci(G, alpha=0.5, verbose="INFO")
+        orc.compute_ricci_curvature()
+        return orc.G
+        # edges_dict = {}
+        #
+        # # Open the .edge_list file in read mode
+        # with open("/home/resl/csci566/subgraph-sketching/src/datasets/graph_Cora.edge_list", "r") as file:
+        #     # Iterate over each line in the file
+        #     for line in file:
+        #         parts = line.strip().split()
+        #         node1, node2, weight = int(parts[0]), int(parts[1]), float(parts[2])
+        #         edges_dict[(node1, node2)] = weight
+        #
+        # return edges_dict
+
+    def get_ricci(self, links, ricci_graph):
+        ricci = []
+        for link in links:
+            try:
+                ricci.append(ricci_graph[int(link[0])][int(link[1])]["ricciCurvature"])
+            except:
+                ricci.append(0.0)
+        return torch.tensor(ricci)
+
+    def get_subgraph_features(self, links, hash_table, cards, batch_size=11000000):
+        """
+        extracts the features that play a similar role to the labeling trick features. These can be thought of as approximations
+        of path distances from the source and destination nodes. There are k+2+\sum_1^k 2k features
+        @param links: tensor [n_edges, 2]
+        @param hash_table: A Dict{Dict} of torch tensor [num_nodes, hash_size] keys are hop index and hash type (hyperlogloghash, minhash)
+        @param cards: Tensor[n_nodes, max_hops] of hll neighbourhood cardinality estimates
+        @param batch_size: batch size for computing intersections. 11m splits the large ogb datasets into 3.
+        @return: Tensor[n_edges, max_hops(max_hops+2)]
+        """
+        if links.dim() == 1:
+            links = links.unsqueeze(0)
+
+        #ricci_G = self.load_ricci()
+
+        link_loader = DataLoader(range(links.size(0)), batch_size, shuffle=False, num_workers=0)
+        all_features = []
+        for batch in tqdm(link_loader):
+            intersections = self._get_intersections(links[batch], hash_table)
+            #ricci = self.get_ricci(links[batch], ricci_G)
+            cards1, cards2 = cards.to(links.device)[links[batch, 0]], cards.to(links.device)[links[batch, 1]]
+            features = torch.zeros((len(batch), self.max_hops * (self.max_hops + 2)), dtype=torch.float, device=links.device)
+            features[:, 0] = intersections[(1, 1)]
+            if self.max_hops == 1:
+                features[:, 1] = cards2[:, 0] - features[:, 0]
+                features[:, 2] = cards1[:, 0] - features[:, 0]
+            elif self.max_hops == 2:
+                features[:, 1] = intersections[(2, 1)] - features[:, 0]  # (2,1)
+                features[:, 2] = intersections[(1, 2)] - features[:, 0]  # (1,2)
+                features[:, 3] = intersections[(2, 2)] - features[:, 0] - features[:, 1] - features[:, 2]  # (2,2)
+                features[:, 4] = cards2[:, 0] - torch.sum(features[:, 0:2], dim=1)  # (0, 1)
+                features[:, 5] = cards1[:, 0] - features[:, 0] - features[:, 2]  # (1, 0)
+                features[:, 6] = cards2[:, 1] - torch.sum(features[:, 0:5], dim=1)  # (0, 2)
+                features[:, 7] = cards1[:, 1] - features[:, 0] - torch.sum(features[:, 0:4], dim=1) - features[:,
+                                                                                                      5]  # (2, 0)
+            elif self.max_hops == 3:
+                features[:, 1] = intersections[(2, 1)] - features[:, 0]  # (2,1)
+                features[:, 2] = intersections[(1, 2)] - features[:, 0]  # (1,2)
+                features[:, 3] = intersections[(2, 2)] - features[:, 0] - features[:, 1] - features[:, 2]  # (2,2)
+                features[:, 4] = intersections[(3, 1)] - features[:, 0] - features[:, 1]  # (3,1)
+                features[:, 5] = intersections[(1, 3)] - features[:, 0] - features[:, 2]  # (1, 3)
+                features[:, 6] = intersections[(3, 2)] - torch.sum(features[:, 0:4], dim=1) - features[:, 4]  # (3,2)
+                features[:, 7] = intersections[(2, 3)] - torch.sum(features[:, 0:4], dim=1) - features[:, 5]  # (2,3)
+                features[:, 8] = intersections[(3, 3)] - torch.sum(features[:, 0:8], dim=1)  # (3,3)
+                features[:, 9] = cards2[:, 0] - features[:, 0] - features[:, 1] - features[:, 4]  # (0, 1)
+                features[:, 10] = cards1[:, 0] - features[:, 0] - features[:, 2] - features[:, 5]  # (1, 0)
+                features[:, 11] = cards2[:, 1] - torch.sum(features[:, 0:5], dim=1) - features[:, 6] - features[:,
+                                                                                                       9]  # (0, 2)
+                features[:, 12] = cards1[:, 1] - torch.sum(features[:, 0:5], dim=1) - features[:, 7] - features[:,
+                                                                                                       10]  # (2, 0)
+                features[:, 13] = cards2[:, 2] - torch.sum(features[:, 0:9], dim=1) - features[:, 9] - features[:,
+                                                                                                       11]  # (0, 3)
+                features[:, 14] = cards1[:, 2] - torch.sum(features[:, 0:9], dim=1) - features[:, 10] - features[:,
+                                                                                                        12]  # (3, 0)
+            else:
+                raise NotImplementedError("Only 1, 2 and 3 hop hashes are implemented")
+            #features[:, -1] = ricci
+            if not self.use_zero_one:
+                if self.max_hops == 2:  # for two hops any positive edge that's dist 1 from u must be dist 2 from v etc.
+                    features[:, 4] = 0
+                    features[:, 5] = 0
+                elif self.max_hops == 3:  # in addition for three hops 0,2 is impossible for positive edges
+                    features[:, 4] = 0
+                    features[:, 5] = 0
+                    features[:, 11] = 0
+                    features[:, 12] = 0
+            if self.floor_sf:  # should be more accurate, but in practice makes no difference
+                features[features < 0] = 0
+            all_features.append(features)
+        features = torch.cat(all_features, dim=0)
+        return features

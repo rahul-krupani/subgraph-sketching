@@ -368,7 +368,7 @@ class ElphHashes(object):
         link_loader = DataLoader(range(links.size(0)), batch_size, shuffle=False, num_workers=0)
         all_features = []
         for batch in tqdm(link_loader):
-            intersections = self.get_intersections(links[batch], hash_table)
+            intersections = self._get_intersections(links[batch], hash_table)
             #ricci = self.get_ricci(links[batch], ricci_G)
             cards1, cards2 = cards.to(links.device)[links[batch, 0]], cards.to(links.device)[links[batch, 1]]
             features = torch.zeros((len(batch), self.max_hops * (self.max_hops + 2)), dtype=torch.float, device=links.device)

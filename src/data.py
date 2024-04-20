@@ -82,6 +82,19 @@ def get_data(args):
     if dataset_name.startswith('ogbl'):
         use_lcc_flag = False
         dataset = PygLinkPropPredDataset(name=dataset_name, root=path)
+        if dataset_name == 'ogbl-biokg':
+            num_nodes = 0
+            for i in dataset.data.num_nodes_dict.keys():
+                num_nodes += dataset.data.num_nodes_dict[i]
+            for ind, i in enumerate(dataset.data.edge_index_dict.keys()):
+                if ind == 0:
+                    edges = dataset.data.edge_index_dict[i]
+                else:
+                    edges = torch.concat((edges, dataset.data.edge_index_dict[i]), dim=1)
+            dataset.data.num_nodes = num_nodes
+            dataset.data.edge_index = edges
+            dataset.data.x = torch.ones((dataset.data.num_nodes, 1))
+            dataset.data.edge_weight = torch.ones(dataset.data.edge_index.size(1), dtype=int)
         if dataset_name == 'ogbl-ddi':
             dataset.data.x = torch.ones((dataset.data.num_nodes, 1))
             dataset.data.edge_weight = torch.ones(dataset.data.edge_index.size(1), dtype=int)
@@ -89,7 +102,7 @@ def get_data(args):
         dataset = Planetoid(path, dataset_name)
 
     # set the metric
-    if dataset_name.startswith('ogbl-citation'):
+    if dataset_name.startswith('ogbl-citation') or dataset_name.startswith('ogbl-wikikg'):
         eval_metric = 'mrr'
         directed = True
 
@@ -188,6 +201,9 @@ def get_ogb_pos_edges(split_edge, split):
     elif 'source_node' in split_edge[split]:
         pos_edge = torch.stack([split_edge[split]['source_node'], split_edge[split]['target_node']],
                                dim=1)
+    elif 'head' in split_edge[split]:
+        pos_edge = torch.stack([split_edge[split]['head'], split_edge[split]['tail']],
+                               dim=1)
     else:
         raise NotImplementedError
     return pos_edge
@@ -209,7 +225,7 @@ def get_ogb_train_negs(split_edge, edge_index, num_nodes, num_negs=1, dataset_na
     else:  # any source is fine
         new_edge_index, _ = add_self_loops(edge_index)
         neg_edge = negative_sampling(
-            new_edge_index, num_nodes=int(num_nodes),
+            new_edge_index, num_nodes=num_nodes,
             num_neg_samples=pos_edge.size(1) * num_negs)
     return neg_edge.t()
 
@@ -224,6 +240,11 @@ def make_obg_supervision_edges(split_edge, split, neg_edges=None):
             n_neg_nodes = split_edge[split]['target_node_neg'].shape[1]
             neg_edges = torch.stack([split_edge[split]['source_node'].unsqueeze(1).repeat(1, n_neg_nodes).ravel(),
                                      split_edge[split]['target_node_neg'].ravel()
+                                     ]).t()
+        elif 'tail_neg' in split_edge[split]:
+            n_neg_nodes = split_edge[split]['tail_neg'].shape[1]
+            neg_edges = torch.stack([split_edge[split]['head'].unsqueeze(1).repeat(1, n_neg_nodes).ravel(),
+                                     split_edge[split]['tail_neg'].ravel()
                                      ]).t()
         else:
             raise NotImplementedError
