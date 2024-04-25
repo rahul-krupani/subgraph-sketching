@@ -82,19 +82,35 @@ def get_data(args):
     if dataset_name.startswith('ogbl'):
         use_lcc_flag = False
         dataset = PygLinkPropPredDataset(name=dataset_name, root=path)
+        
         if dataset_name == 'ogbl-biokg':
-            num_nodes = 0
-            for i in dataset.data.num_nodes_dict.keys():
-                num_nodes += dataset.data.num_nodes_dict[i]
-            for ind, i in enumerate(dataset.data.edge_index_dict.keys()):
-                if ind == 0:
-                    edges = dataset.data.edge_index_dict[i]
+            num_nodes_dict = dataset.data.num_nodes_dict
+            offset = 0
+            offsets = {}
+
+            for node_type, count in num_nodes_dict.items():
+                offsets[node_type] = offset
+                offset += count
+
+            edges = None
+            for (src_node_type, _, tgt_node_type), edge_index in dataset.data.edge_index_dict.items():
+                src_offset = offsets[src_node_type]
+                tgt_offset = offsets[tgt_node_type]
+                
+                adjusted_edge_index = edge_index.clone()
+                adjusted_edge_index[0, :] += src_offset
+                adjusted_edge_index[1, :] += tgt_offset
+                
+                if edges is None:
+                    edges = adjusted_edge_index
                 else:
-                    edges = torch.concat((edges, dataset.data.edge_index_dict[i]), dim=1)
-            dataset.data.num_nodes = num_nodes
+                    edges = torch.cat((edges, adjusted_edge_index), dim=1)
+
+            dataset.data.num_nodes = sum(num_nodes_dict.values())
             dataset.data.edge_index = edges
             dataset.data.x = torch.ones((dataset.data.num_nodes, 1))
             dataset.data.edge_weight = torch.ones(dataset.data.edge_index.size(1), dtype=int)
+
         if dataset_name == 'ogbl-ddi':
             dataset.data.x = torch.ones((dataset.data.num_nodes, 1))
             dataset.data.edge_weight = torch.ones(dataset.data.edge_index.size(1), dtype=int)
@@ -102,9 +118,9 @@ def get_data(args):
         dataset = Planetoid(path, dataset_name)
 
     # set the metric
-    if dataset_name.startswith('ogbl-citation') or dataset_name.startswith('ogbl-wikikg'):
+    if dataset_name.startswith('ogbl-biokg') or dataset_name.startswith('ogbl-citation') or dataset_name.startswith('ogbl-wikikg'):
         eval_metric = 'mrr'
-        directed = True
+        directed = False
 
     if dataset_name.startswith('ogbl-vessel'):
         eval_metric = 'auc'
@@ -117,6 +133,10 @@ def get_data(args):
     if dataset_name.startswith('ogbl'):  # use the built in splits
         data = dataset[0]
         split_edge = dataset.get_edge_split()
+        print("PRINTING SHAPES")
+        print("\n\n\n",split_edge['train'].keys())
+        print(split_edge['test']['head_neg'].shape, split_edge['test']['tail_neg'].shape)
+        print(split_edge['valid'].keys())
         if dataset_name == 'ogbl-collab' and args.year > 0:  # filter out training edges before args.year
             data, split_edge = filter_by_year(data, split_edge, args.year)
         splits = get_ogb_data(data, split_edge, dataset_name, args.num_negs)
@@ -126,7 +146,7 @@ def get_data(args):
         train_data, val_data, test_data = transform(dataset.data)
         splits = {'train': train_data, 'valid': val_data, 'test': test_data}
 
-    return dataset, splits, directed, eval_metric
+    return dataset, splits, directed, eval_metric, dataset.data.num_nodes
 
 
 def filter_by_year(data, split_edge, year):
@@ -227,6 +247,7 @@ def get_ogb_train_negs(split_edge, edge_index, num_nodes, num_negs=1, dataset_na
         neg_edge = negative_sampling(
             new_edge_index, num_nodes=num_nodes,
             num_neg_samples=pos_edge.size(1) * num_negs)
+    print("PRINTINGGGGG: ", neg_edge.shape)
     return neg_edge.t()
 
 
@@ -242,10 +263,16 @@ def make_obg_supervision_edges(split_edge, split, neg_edges=None):
                                      split_edge[split]['target_node_neg'].ravel()
                                      ]).t()
         elif 'tail_neg' in split_edge[split]:
-            n_neg_nodes = split_edge[split]['tail_neg'].shape[1]
-            neg_edges = torch.stack([split_edge[split]['head'].unsqueeze(1).repeat(1, n_neg_nodes).ravel(),
-                                     split_edge[split]['tail_neg'].ravel()
-                                     ]).t()
+            neg_edges = torch.stack([split_edge[split]['head'], split_edge[split]['tail_neg'][:,1]],
+                               dim=1)
+            neg_edges = torch.concat([neg_edges, torch.stack([split_edge[split]['head'], split_edge[split]['tail_neg'][:,2]],
+                               dim=1)], dim=0)
+            neg_edges = torch.concat([neg_edges, torch.stack([split_edge[split]['head'], split_edge[split]['tail_neg'][:,3]],
+                               dim=1)], dim=0)
+            # n_neg_nodes = split_edge[split]['tail_neg'].shape[1]
+            # neg_edges = torch.stack([split_edge[split]['head'].unsqueeze(1).repeat(1, n_neg_nodes).ravel(),
+            #                          split_edge[split]['tail_neg'].ravel()
+            #                          ]).t()
         else:
             raise NotImplementedError
 
